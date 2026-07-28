@@ -1544,21 +1544,6 @@ const connection = new web3.Connection(web3.clusterApiUrl('mainnet-beta'), 'conf
 // Semua transfer $PISANG di bawah hanya memindahkan token yang SUDAH dimiliki
 // wallet yang menandatangani transaksi (burn saldo sendiri, atau kirim saldo
 // sendiri ke alamat lain) — tidak ada mint baru dari mana pun.
-const PISANG_MINT_ADDRESS = '27PKhWpdaCZ4bsf1p5jDL1EiHENuwSFdLc61B1oopump';
-const MIN_WITHDRAW_PISANG = 50000;
-const PISANG_BUY_URL = 'https://pump.fun/coin/27PKhWpdaCZ4bsf1p5jDL1EiHENuwSFdLc61B1oopump';
-let pisangMintPubkey = null;
-let pisangDecimalsCache = null;
-function getPisangMint(){
-  if(!pisangMintPubkey) pisangMintPubkey = new web3.PublicKey(PISANG_MINT_ADDRESS);
-  return pisangMintPubkey;
-}
-async function getPisangDecimals(){
-  if(pisangDecimalsCache != null) return pisangDecimalsCache;
-  const info = await splToken.getMint(connection, getPisangMint());
-  pisangDecimalsCache = info.decimals;
-  return pisangDecimalsCache;
-}
 const $ = id => document.getElementById(id);
 
 function game(){ return window.MomonGame; }
@@ -1572,6 +1557,109 @@ function requireProvider(){
   if(!p) throw new Error('Ekstensi Phantom tidak terdeteksi / belum terhubung.');
   return p;
 }
+
+// ==========================================================================
+// MODUL TOKEN $PISANG
+// Membungkus semua logika terkait token $PISANG (alamat mint, saldo, suplai,
+// burn, transfer) dalam satu namespace supaya rapi & mudah dipakai ulang.
+// $PISANG adalah token SPL SUNGGUHAN yang sudah listing di pump.fun — BUKAN
+// token uji yang dibuat/dikendalikan game ini. Karena ini token pasar publik,
+// modul ini TIDAK PERNAH mencetak (mint) suplai baru — hanya membaca saldo/
+// suplai on-chain, dan memindahkan (transfer/burn) token yang SUDAH dimiliki
+// wallet yang menandatangani transaksi.
+// ==========================================================================
+const PisangToken = (function(){
+  const MINT_ADDRESS = '27PKhWpdaCZ4bsf1p5jDL1EiHENuwSFdLc61B1oopump';
+  const BUY_URL = 'https://pump.fun/coin/27PKhWpdaCZ4bsf1p5jDL1EiHENuwSFdLc61B1oopump';
+  const MIN_WITHDRAW = 50000;
+  let mintPubkey = null;
+  let decimalsCache = null;
+
+  function getMint(){
+    if(!mintPubkey) mintPubkey = new web3.PublicKey(MINT_ADDRESS);
+    return mintPubkey;
+  }
+
+  async function getDecimals(){
+    if(decimalsCache != null) return decimalsCache;
+    const info = await splToken.getMint(connection, getMint());
+    decimalsCache = info.decimals;
+    return decimalsCache;
+  }
+
+  // Saldo $PISANG milik wallet yang sedang terhubung (0 kalau belum konek
+  // atau belum pernah pegang $PISANG sama sekali).
+  async function getBalance(){
+    const state = game().getState();
+    if(!state.wallet) return 0;
+    try{
+      const mint = getMint();
+      const owner = new web3.PublicKey(state.wallet);
+      const ata = await splToken.getAssociatedTokenAddress(mint, owner);
+      const bal = await connection.getTokenAccountBalance(ata);
+      return bal.value.uiAmount || 0;
+    }catch(e){ return 0; }
+  }
+
+  // Suplai beredar $PISANG di jaringan (bukan suplai buatan game).
+  async function getSupply(){
+    try{
+      const info = await connection.getTokenSupply(getMint());
+      return info.value.uiAmount || 0;
+    }catch(e){ return null; }
+  }
+
+  // Bakar sejumlah $PISANG dari saldo wallet yang sedang terhubung — transaksi
+  // burn mainnet sungguhan (dipakai token sink: Topi Pesta, breeding, dsb).
+  async function burn(amountUi){
+    const wallet = requireProvider();
+    const payer = wallet.publicKey;
+    const mint = getMint();
+    const decimals = await getDecimals();
+    const ata = await splToken.getAssociatedTokenAddress(mint, payer);
+    const tx = new web3.Transaction().add(
+      splToken.createBurnInstruction(ata, mint, payer, Math.round(amountUi * 10**decimals))
+    );
+    tx.feePayer = payer;
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    const signed = await wallet.signTransaction(tx);
+    const sig = await connection.sendRawTransaction(signed.serialize());
+    await connection.confirmTransaction(sig, 'confirmed');
+    return sig;
+  }
+
+  // Kirim sejumlah $PISANG dari saldo wallet yang SEDANG terhubung ke alamat
+  // tujuan. Ini HANYA memindahkan token yang sudah dimiliki wallet penanda
+  // tangan (mis. untuk withdrawal ke dompet sendiri, kirim ke teman, atau
+  // treasury membayar reward pemain lain secara manual) — tidak pernah
+  // mencetak token baru.
+  async function sendTo(toAddressStr, amountUi){
+    const wallet = requireProvider();
+    const payer = wallet.publicKey;
+    const mint = getMint();
+    const decimals = await getDecimals();
+    const to = new web3.PublicKey(toAddressStr);
+    const fromAta = await splToken.getAssociatedTokenAddress(mint, payer);
+    const toAta = await splToken.getAssociatedTokenAddress(mint, to);
+    const tx = new web3.Transaction();
+    const toInfo = await connection.getAccountInfo(toAta);
+    if(!toInfo){
+      tx.add(splToken.createAssociatedTokenAccountInstruction(payer, toAta, to, mint));
+    }
+    tx.add(splToken.createTransferInstruction(fromAta, toAta, payer, Math.round(amountUi * 10**decimals)));
+    tx.feePayer = payer;
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    const signed = await wallet.signTransaction(tx);
+    const sig = await connection.sendRawTransaction(signed.serialize());
+    await connection.confirmTransaction(sig, 'confirmed');
+    return sig;
+  }
+
+  return {
+    MINT_ADDRESS, BUY_URL, MIN_WITHDRAW,
+    getMint, getDecimals, getBalance, getSupply, burn, sendTo
+  };
+})();
 
 function getMetaplex(){
   return Metaplex.make(connection)
@@ -1625,75 +1713,11 @@ async function mintMomonNFT(){
   return { mint: state.nftMint, traits };
 }
 
-// ---------- 2) $PISANG — token SPL nyata (read-only balance, burn saldo
-// sendiri, dan kirim saldo sendiri). TIDAK ADA fungsi mint di sini — lihat
-// catatan di atas PISANG_MINT_ADDRESS kenapa itu sengaja tidak dibuat.
-async function burnPisang(amountUi){
-  const wallet = requireProvider();
-  const payer = wallet.publicKey;
-  const mint = getPisangMint();
-  const decimals = await getPisangDecimals();
-  const ata = await splToken.getAssociatedTokenAddress(mint, payer);
-  const tx = new web3.Transaction().add(
-    splToken.createBurnInstruction(ata, mint, payer, Math.round(amountUi * 10**decimals))
-  );
-  tx.feePayer = payer;
-  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  const signed = await wallet.signTransaction(tx);
-  const sig = await connection.sendRawTransaction(signed.serialize());
-  await connection.confirmTransaction(sig, 'confirmed');
-  return sig;
-}
-
-// Kirim sejumlah $PISANG dari saldo wallet yang SEDANG terhubung ke alamat
-// tujuan. Ini HANYA memindahkan token yang sudah dimiliki wallet penanda
-// tangan — cocok dipakai pemegang treasury untuk membayar reward pemain
-// secara manual, atau pemain saling kirim token, tanpa pernah mencetak
-// token baru.
-async function sendPisangTo(toAddressStr, amountUi){
-  const wallet = requireProvider();
-  const payer = wallet.publicKey;
-  const mint = getPisangMint();
-  const decimals = await getPisangDecimals();
-  const to = new web3.PublicKey(toAddressStr);
-  const fromAta = await splToken.getAssociatedTokenAddress(mint, payer);
-  const toAta = await splToken.getAssociatedTokenAddress(mint, to);
-  const tx = new web3.Transaction();
-  const toInfo = await connection.getAccountInfo(toAta);
-  if(!toInfo){
-    tx.add(splToken.createAssociatedTokenAccountInstruction(payer, toAta, to, mint));
-  }
-  tx.add(splToken.createTransferInstruction(fromAta, toAta, payer, Math.round(amountUi * 10**decimals)));
-  tx.feePayer = payer;
-  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  const signed = await wallet.signTransaction(tx);
-  const sig = await connection.sendRawTransaction(signed.serialize());
-  await connection.confirmTransaction(sig, 'confirmed');
-  return sig;
-}
-
-async function getPisangBalance(){
-  const state = game().getState();
-  if(!state.wallet) return 0;
-  try{
-    const mint = getPisangMint();
-    const owner = new web3.PublicKey(state.wallet);
-    const ata = await splToken.getAssociatedTokenAddress(mint, owner);
-    const bal = await connection.getTokenAccountBalance(ata);
-    return bal.value.uiAmount || 0;
-  }catch(e){ return 0; } // wajar bernilai 0 kalau wallet belum pernah pegang $PISANG
-}
-
-async function getPisangSupply(){
-  try{
-    const info = await connection.getTokenSupply(getPisangMint());
-    return info.value.uiAmount || 0;
-  }catch(e){ return null; }
-}
+// ---------- 2) $PISANG kini dilayani oleh modul PisangToken di atas ----------
 
 // ---------- 3) Breeding, Staking, Kirim/Jual ----------
 async function breedMomon(partnerMintStr){
-  await burnPisang(20); // biaya breeding — transaksi burn mainnet sungguhan
+  await PisangToken.burn(20); // biaya breeding — transaksi burn mainnet sungguhan
   // Catatan: trait pasangan belum diverifikasi/di-fetch on-chain di versi ini,
   // jadi hasil trait masih diacak lokal — lihat catatan produksi di tray NFT.
   return await mintMomonNFT();
@@ -1765,22 +1789,22 @@ async function renderWithdrawProgress(){
   if(!fillEl || !textEl || !btn) return;
   const state = game().getState();
   const connected = !!state.wallet;
-  const minFmt = MIN_WITHDRAW_PISANG.toLocaleString('id-ID');
+  const minFmt = PisangToken.MIN_WITHDRAW.toLocaleString('id-ID');
   if(!connected){
     fillEl.style.width = '0%';
     textEl.textContent = `Saldo: 0 / ${minFmt} $PISANG`;
     btn.setAttribute('disabled','true');
     return;
   }
-  const bal = await getPisangBalance();
-  const pct = Math.min(100, (bal / MIN_WITHDRAW_PISANG) * 100);
+  const bal = await PisangToken.getBalance();
+  const pct = Math.min(100, (bal / PisangToken.MIN_WITHDRAW) * 100);
   fillEl.style.width = pct + '%';
   const balFmt = Number(bal).toLocaleString('id-ID');
-  if(bal >= MIN_WITHDRAW_PISANG){
+  if(bal >= PisangToken.MIN_WITHDRAW){
     textEl.textContent = `Saldo: ${balFmt} / ${minFmt} $PISANG — syarat minimum terpenuhi ✅`;
     btn.removeAttribute('disabled');
   } else {
-    const sisaFmt = (MIN_WITHDRAW_PISANG - bal).toLocaleString('id-ID');
+    const sisaFmt = (PisangToken.MIN_WITHDRAW - bal).toLocaleString('id-ID');
     textEl.textContent = `Saldo: ${balFmt} / ${minFmt} $PISANG — kurang ${sisaFmt} lagi`;
     btn.setAttribute('disabled','true');
   }
@@ -1800,10 +1824,10 @@ async function renderChain(){
   $('btnMintNft').textContent = state.nftMint ? 'Sudah punya NFT' : 'Mint Momon jadi NFT (Mainnet)';
   $('btnMintNft').toggleAttribute('disabled', !!state.nftMint);
 
-  const bal = await getPisangBalance();
-  const supply = await getPisangSupply();
+  const bal = await PisangToken.getBalance();
+  const supply = await PisangToken.getSupply();
   const supplyText = supply!=null ? ` · Suplai beredar: ${supply}` : '';
-  $('chainPisangStatus').innerHTML = `Saldo: ${bal} $PISANG${supplyText}<br><span style="font-size:11px;word-break:break-all;">Mint: ${PISANG_MINT_ADDRESS}</span>`;
+  $('chainPisangStatus').innerHTML = `Saldo: ${bal} $PISANG${supplyText}<br><span style="font-size:11px;word-break:break-all;">Mint: ${PisangToken.MINT_ADDRESS}</span>`;
 
   $('chainHatStatus').textContent = state.hasPartyHat ? '🎉 Sudah punya Topi Pesta!' : 'Belum punya Topi Pesta.';
   $('btnBuyHat').toggleAttribute('disabled', !!state.hasPartyHat);
@@ -1837,16 +1861,16 @@ function initChainUI(){
   }));
 
   $('btnBuyPisang').addEventListener('click', ()=>{
-    window.open(PISANG_BUY_URL, '_blank', 'noopener');
+    window.open(PisangToken.BUY_URL, '_blank', 'noopener');
   });
 
   $('btnBuyHat').addEventListener('click', withLoading($('btnBuyHat'), async ()=>{
     const state = game().getState();
     if(state.hasPartyHat){ return; }
-    if((await getPisangBalance()) < 10){
+    if((await PisangToken.getBalance()) < 10){
       game().toast('Butuh minimal 10 $PISANG untuk beli Topi Pesta'); return;
     }
-    await burnPisang(10);
+    await PisangToken.burn(10);
     state.hasPartyHat = true;
     await game().save();
     game().render();
@@ -1869,7 +1893,7 @@ function initChainUI(){
   }));
 
   $('btnBreed').addEventListener('click', withLoading($('btnBreed'), async ()=>{
-    if((await getPisangBalance()) < 20){
+    if((await PisangToken.getBalance()) < 20){
       game().toast('Butuh minimal 20 $PISANG untuk breeding'); return;
     }
     const partner = $('breedPartnerInput').value.trim();
@@ -1882,8 +1906,8 @@ function initChainUI(){
     const amt = parseFloat($('pisangSendAmountInput').value);
     if(!to){ game().toast('Isi alamat tujuan dulu'); return; }
     if(!amt || amt<=0){ game().toast('Isi jumlah $PISANG yang valid'); return; }
-    if((await getPisangBalance()) < amt){ game().toast('Saldo $PISANG kamu tidak cukup'); return; }
-    await sendPisangTo(to, amt);
+    if((await PisangToken.getBalance()) < amt){ game().toast('Saldo $PISANG kamu tidak cukup'); return; }
+    await PisangToken.sendTo(to, amt);
     game().toast(`Berhasil kirim ${amt} $PISANG ✅`);
   }));
 
@@ -1901,13 +1925,13 @@ function initChainUI(){
     const to = state.wallet;
     const amt = parseFloat($('withdrawAmountInput').value);
     if(!to){ game().toast('Hubungkan dompet dulu sebelum withdrawal'); return; }
-    if(!amt || amt < MIN_WITHDRAW_PISANG){
-      game().toast(`Jumlah withdrawal minimum adalah ${MIN_WITHDRAW_PISANG.toLocaleString('id-ID')} $PISANG`);
+    if(!amt || amt < PisangToken.MIN_WITHDRAW){
+      game().toast(`Jumlah withdrawal minimum adalah ${PisangToken.MIN_WITHDRAW.toLocaleString('id-ID')} $PISANG`);
       return;
     }
-    const bal = await getPisangBalance();
+    const bal = await PisangToken.getBalance();
     if(bal < amt){ game().toast('Saldo $PISANG kamu tidak cukup'); return; }
-    await sendPisangTo(to, amt);
+    await PisangToken.sendTo(to, amt);
     game().toast(`Berhasil withdraw ${amt.toLocaleString('id-ID')} $PISANG ke dompetmu ✅`);
     await renderWithdrawProgress();
   }));
@@ -1923,9 +1947,9 @@ function installPisangSpendBridge(){
   const g = window.MomonGame;
   if(!g) return;
   g.spendPisang = async (amountUi)=>{
-    const bal = await getPisangBalance();
+    const bal = await PisangToken.getBalance();
     if(bal < amountUi) throw new Error('Saldo $PISANG tidak cukup');
-    return await burnPisang(amountUi);
+    return await PisangToken.burn(amountUi);
   };
 }
 
