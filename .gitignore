@@ -1,0 +1,6 @@
+cd momon-backend
+git init
+git add .
+git commit -m "Backend awal Momon"
+git remote add origin https://github.com/username/momon-backend.git
+git push -u origin main
